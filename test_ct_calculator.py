@@ -32,7 +32,7 @@ from inventory import (
     AgeDistributionStream,
 )
 from inventory_parser import (
-    inventory_from_paste, QUEUE_INVENTORY_SCHEMAS,
+    inventory_from_paste, inventory_from_input_or_paste, QUEUE_INVENTORY_SCHEMAS,
 )
 from Cycle_time_calculator import (
     DeterministicScenario, DeterministicCycleTimeCalculator,
@@ -264,6 +264,65 @@ class TestInventoryParser:
         )
         inv = inventory_from_paste(raw, queue="AC", snapshot_date=date(2026, 1, 6))
         assert inv.items_by_age == {10: 1.0, 15: 1.0}
+
+
+class TestInventoryFromInputOrPaste:
+    def test_inv_input_only(self):
+        inv = inventory_from_input_or_paste(
+            queue="EDD", snapshot_date=date(2026, 1, 6),
+            inv_input="65:1, 70:2, 100:5",
+        )
+        assert inv.items_by_age == {65: 1.0, 70: 2.0, 100: 5.0}
+
+    def test_paste_only(self):
+        raw = "QUEUE\tDays Difference\nEDD\t100\nEDD\t100\nEDD\t200\n"
+        inv = inventory_from_input_or_paste(
+            queue="EDD", snapshot_date=date(2026, 1, 6),
+            inventory_raw=raw,
+        )
+        assert inv.items_by_age == {100: 2.0, 200: 1.0}
+
+    def test_both_provided_paste_wins(self, capsys):
+        raw = "QUEUE\tDays Difference\nEDD\t100\n"
+        inv = inventory_from_input_or_paste(
+            queue="EDD", snapshot_date=date(2026, 1, 6),
+            inv_input="50:99",
+            inventory_raw=raw,
+        )
+        # Paste wins → only the 100-aged item, not the 50:99 inline
+        assert inv.items_by_age == {100: 1.0}
+        captured = capsys.readouterr()
+        assert "Using inventory_raw" in captured.out
+
+    def test_both_provided_inv_wins_when_flagged(self, capsys):
+        raw = "QUEUE\tDays Difference\nEDD\t100\n"
+        inv = inventory_from_input_or_paste(
+            queue="EDD", snapshot_date=date(2026, 1, 6),
+            inv_input="50:99",
+            inventory_raw=raw,
+            prefer_raw=False,
+        )
+        # inline wins → 50:99
+        assert inv.items_by_age == {50: 99.0}
+        captured = capsys.readouterr()
+        assert "Using inv_input" in captured.out
+
+    def test_both_empty_raises(self):
+        with pytest.raises(ValueError, match="both inv_input and inventory_raw are empty"):
+            inventory_from_input_or_paste(
+                queue="EDD", snapshot_date=date(2026, 1, 6),
+                inv_input="",
+                inventory_raw="",
+            )
+
+    def test_whitespace_only_treated_as_empty(self):
+        # Common case: user leaves an empty triple-quoted string with just newlines
+        with pytest.raises(ValueError, match="both inv_input and inventory_raw are empty"):
+            inventory_from_input_or_paste(
+                queue="EDD", snapshot_date=date(2026, 1, 6),
+                inv_input="   ",
+                inventory_raw="\n\n  \n",
+            )
 
 
 # =============================================================================

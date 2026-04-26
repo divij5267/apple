@@ -291,6 +291,80 @@ def _parse_single_table(raw: str) -> pd.DataFrame:
 
 
 # =============================================================================
+# DUAL-FORMAT INVENTORY BUILDER
+# =============================================================================
+# Each queue can provide its initial inventory in TWO formats:
+#
+#   (1) inv_input  — comma-separated string "age:count, age:count, ..."
+#                     Quick to type, useful for tests / manual edits.
+#                     Example:  "1:2, 5:10, 23:699"
+#
+#   (2) inventory_raw — paste of the actual extract (string or DataFrame).
+#                       Production format for real Snowflake/Excel data.
+#                       Parsed via the queue's QUEUE_INVENTORY_SCHEMAS entry.
+#
+# Precedence when BOTH non-empty:
+#   prefer_raw=True  (default) → paste wins; warning printed.
+#   prefer_raw=False           → inv_input wins; warning printed.
+# Both empty → ValueError.
+# =============================================================================
+
+def inventory_from_input_or_paste(
+    queue: str,
+    snapshot_date: date,
+    inv_input: str = "",
+    inventory_raw: Union[str, pd.DataFrame] = "",
+    prefer_raw: bool = True,
+) -> DeterministicInventory:
+    """Build a DeterministicInventory from either format. See module docstring."""
+    has_inv = bool(inv_input and isinstance(inv_input, str) and inv_input.strip())
+    has_raw = bool(
+        (isinstance(inventory_raw, str) and inventory_raw.strip())
+        or (isinstance(inventory_raw, pd.DataFrame) and not inventory_raw.empty)
+    )
+
+    if not has_inv and not has_raw:
+        raise ValueError(
+            f"Queue {queue!r}: both inv_input and inventory_raw are empty. "
+            "Provide at least one."
+        )
+
+    if has_inv and has_raw:
+        winner = "inventory_raw (paste)" if prefer_raw else "inv_input (inline)"
+        print(
+            f"\u26a0\ufe0f  Queue {queue!r}: both inv_input and inventory_raw "
+            f"provided. Using {winner}. Set prefer_raw=False/True to flip."
+        )
+        if prefer_raw:
+            return inventory_from_paste(inventory_raw, queue=queue, snapshot_date=snapshot_date)
+        return _parse_inv_input_string(inv_input, snapshot_date)
+
+    if has_raw:
+        return inventory_from_paste(inventory_raw, queue=queue, snapshot_date=snapshot_date)
+
+    return _parse_inv_input_string(inv_input, snapshot_date)
+
+
+def _parse_inv_input_string(inv_input: str, snapshot_date: date) -> DeterministicInventory:
+    """Parse a 'age:count, age:count, ...' string into a DeterministicInventory."""
+    inv = DeterministicInventory(snapshot_date=snapshot_date)
+    for item in inv_input.split(","):
+        item = item.strip()
+        if ":" not in item:
+            continue
+        age_str, count_str = item.split(":", 1)
+        age_str, count_str = age_str.strip(), count_str.strip()
+        if not age_str or not count_str:
+            continue
+        try:
+            inv.add_items(int(age_str), float(count_str))
+        except (ValueError, TypeError):
+            # Skip malformed entries silently — same behaviour as before.
+            pass
+    return inv
+
+
+# =============================================================================
 # DIAGNOSTIC
 # =============================================================================
 

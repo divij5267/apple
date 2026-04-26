@@ -21,6 +21,7 @@ from inventory_parser import (
     InventorySchema,
     QUEUE_INVENTORY_SCHEMAS,
     inventory_from_paste,
+    inventory_from_input_or_paste,
     print_inventory_summary,
 )
 from Calendar import (
@@ -70,6 +71,7 @@ __all__ = [
     "InventorySchema",
     "QUEUE_INVENTORY_SCHEMAS",
     "inventory_from_paste",
+    "inventory_from_input_or_paste",
     "print_inventory_summary",
     # Calendar
     "CalendarManager",
