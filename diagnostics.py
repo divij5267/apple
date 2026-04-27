@@ -130,6 +130,120 @@ def weekly_summary(
 
 
 # =============================================================================
+# MONTHLY SUMMARY — option C two-line-per-row layout
+# =============================================================================
+# Each month produces TWO rows: the first carries FTE values per group + the
+# scalar metrics (Demand, avg_inv_age, P_n's). The second carries TPT values
+# per group on the same group-name columns; non-group cells are blank.
+#
+# Group cells are formatted as "FTE: 33.40" / "TPT:  2.40" so the prefix
+# survives DataFrame.to_string() alignment.
+# =============================================================================
+
+def monthly_summary(
+    result: DeterministicResult,
+    calc: DeterministicCycleTimeCalculator,
+) -> pd.DataFrame:
+    """Return monthly diagnostic table in two-line-per-row format (option C)."""
+    scenario = calc.scenario
+    p = scenario.reporting_percentile
+    offset = (scenario.workable_age_min - 1) if scenario.workable_age_min is not None else 0
+
+    if not result.daily_results:
+        return pd.DataFrame()
+
+    # Group names (preserve order from the scenario's worker_groups)
+    group_names = [gs["name"] for gs in result.daily_results[0].group_stats]
+
+    # Per-day data
+    daily_rows: List[Dict] = []
+    for dr in result.daily_results:
+        total_demand_today = float(sum(a["volume"] for a in dr.arrivals))
+        fte_by_group = {gs["name"]: gs["fte_for_month"] for gs in dr.group_stats}
+        tpt_by_group = {gs["name"]: gs["tpt"] for gs in dr.group_stats}
+        closed_ages_today = dr.get_closed_items_ages()
+        avg_closed = float(np.mean(closed_ages_today)) if closed_ages_today else None
+        daily_rows.append({
+            "year":          dr.date.year,
+            "month":         dr.date.month,
+            "demand":        total_demand_today,
+            "fte_by_group":  fte_by_group,
+            "tpt_by_group":  tpt_by_group,
+            "avg_inv_age":   dr.open_inventory_after.calculate_average_age(),
+            "closed_ages":   closed_ages_today,
+            "avg_closed":    avg_closed,
+        })
+
+    months: Dict[Tuple[int, int], List[Dict]] = {}
+    for r in daily_rows:
+        months.setdefault((r["year"], r["month"]), []).append(r)
+
+    def _ceil_int(x):
+        return int(np.ceil(x)) if x is not None else None
+
+    out_rows: List[Dict] = []
+    for (y, m), rows in sorted(months.items()):
+        total_demand = sum(r["demand"] for r in rows)
+        ftes = {g: float(np.mean([r["fte_by_group"][g] for r in rows])) for g in group_names}
+        tpts = {g: float(np.mean([r["tpt_by_group"][g] for r in rows])) for g in group_names}
+        avg_inv_age = float(np.mean([r["avg_inv_age"] for r in rows]))
+
+        # P_n metrics (same logic as monthly metrics + workable-age offset)
+        all_closed: List[int] = []
+        for r in rows:
+            all_closed.extend(r["closed_ages"])
+        p_direct_raw = float(np.percentile(all_closed, p)) if all_closed else None
+        max_open = max((r["avg_inv_age"] for r in rows), default=None)
+        p_from_open_raw = (
+            max_open * scenario.open_inventory_ratio if max_open is not None else None
+        )
+        max_closed_vals = [r["avg_closed"] for r in rows if r["avg_closed"] is not None]
+        max_closed = max(max_closed_vals) if max_closed_vals else None
+        p_from_closed_raw = (
+            max_closed * scenario.closed_inventory_ratio if max_closed is not None else None
+        )
+
+        p_direct = _ceil_int(p_direct_raw)
+        p_from_open = _ceil_int(p_from_open_raw)
+        p_from_closed = _ceil_int(p_from_closed_raw)
+        if offset:
+            if p_direct is not None:
+                p_direct = p_direct - offset
+            if p_from_open is not None:
+                p_from_open = p_from_open - offset
+            if p_from_closed is not None:
+                p_from_closed = p_from_closed - offset
+
+        # Row 1 — FTE values + scalar metrics
+        row_fte = {
+            "Month":  f"{y}-{m:02d}",
+            "Demand": f"{total_demand:.0f}",
+        }
+        for g in group_names:
+            row_fte[g] = f"FTE: {ftes[g]:>6.2f}"
+        row_fte["avg_inv_age"]         = f"{avg_inv_age:.2f}"
+        row_fte["p_direct"]            = "" if p_direct is None else str(p_direct)
+        row_fte["p_from_open_ratio"]   = "" if p_from_open is None else str(p_from_open)
+        row_fte["p_from_closed_ratio"] = "" if p_from_closed is None else str(p_from_closed)
+        out_rows.append(row_fte)
+
+        # Row 2 — TPT values, blank for non-group cells
+        row_tpt = {
+            "Month":  "",
+            "Demand": "",
+        }
+        for g in group_names:
+            row_tpt[g] = f"TPT: {tpts[g]:>6.2f}"
+        row_tpt["avg_inv_age"]         = ""
+        row_tpt["p_direct"]            = ""
+        row_tpt["p_from_open_ratio"]   = ""
+        row_tpt["p_from_closed_ratio"] = ""
+        out_rows.append(row_tpt)
+
+    return pd.DataFrame(out_rows)
+
+
+# =============================================================================
 # MONTHLY P VALUES helper — used by both charts
 # =============================================================================
 

@@ -408,6 +408,94 @@ class TestWeeklySummary:
                 f"Expected workable-age offset to shrink p_direct, got {df['p_direct'].tolist()}"
 
 
+class TestMonthlySummary:
+    def _build(self, **scenario_overrides):
+        from diagnostics import monthly_summary
+        from Calendar import CalendarManager, load_all_calendars
+        mgr = CalendarManager()
+        load_all_calendars(mgr, [2026])
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(
+                calendar_type=CalendarType.INTERNAL, name="Internal",
+                current_headcount=10, tpt_by_month=2.4,
+                fte_conversion_by_month=Months(
+                    jan=0.75, feb=0.75, mar=0.75, apr=0.75, may=0.75, jun=0.75,
+                    jul=0.75, aug=0.75, sep=0.75, oct=0.75, nov=0.75, dec=0.75,
+                ),
+            ),
+            WorkerGroup(
+                calendar_type=CalendarType.USA, name="RS_USA",
+                current_headcount=5, tpt_by_month=2.5,
+            ),
+        ])
+        defaults = dict(
+            name="LE",
+            workforce=wf,
+            initial_inventory=DeterministicInventory(items_by_age={5: 100, 10: 50}),
+            demand=DeterministicDemand(streams=[
+                DemandStream(name="x", cadence="daily",
+                             monthly_volume=Months(jan=10, feb=10), arrival_age=1),
+            ]),
+            calendar_manager=mgr,
+            start_date=date(2026, 1, 5),
+            end_date=date(2026, 2, 28),
+            open_inventory_ratio=2.0,
+            closed_inventory_ratio=1.0,
+            reporting_percentile=90,
+        )
+        defaults.update(scenario_overrides)
+        s = DeterministicScenario(**defaults)
+        calc = DeterministicCycleTimeCalculator(s)
+        return calc, calc.calculate(), monthly_summary
+
+    def test_two_rows_per_month_layout(self):
+        calc, result, monthly_summary = self._build()
+        df = monthly_summary(result, calc)
+        # Two months → 4 rows (FTE row + TPT row each month)
+        assert len(df) == 4
+        # Even-indexed rows have Month label, odd-indexed rows have ""
+        assert df.iloc[0]["Month"] == "2026-01"
+        assert df.iloc[1]["Month"] == ""
+        assert df.iloc[2]["Month"] == "2026-02"
+        assert df.iloc[3]["Month"] == ""
+
+    def test_columns_include_each_group(self):
+        calc, result, monthly_summary = self._build()
+        df = monthly_summary(result, calc)
+        # Must include both group names as columns
+        assert "Internal" in df.columns
+        assert "RS_USA" in df.columns
+        # And the standard scalar columns
+        for col in ["Month", "Demand", "avg_inv_age",
+                    "p_direct", "p_from_open_ratio", "p_from_closed_ratio"]:
+            assert col in df.columns
+
+    def test_fte_on_first_row_tpt_on_second(self):
+        calc, result, monthly_summary = self._build()
+        df = monthly_summary(result, calc)
+        # First row of each pair carries FTE, second row carries TPT
+        assert df.iloc[0]["Internal"].startswith("FTE:")
+        assert df.iloc[1]["Internal"].startswith("TPT:")
+        assert df.iloc[0]["RS_USA"].startswith("FTE:")
+        assert df.iloc[1]["RS_USA"].startswith("TPT:")
+        # Non-group cells empty on TPT rows
+        assert df.iloc[1]["Demand"] == ""
+        assert df.iloc[1]["avg_inv_age"] == ""
+        assert df.iloc[1]["p_direct"] == ""
+
+    def test_workable_age_offset_applied(self):
+        calc, result, monthly_summary = self._build(
+            initial_inventory=DeterministicInventory(items_by_age={70: 50, 80: 30}),
+            workable_age_min=61,
+        )
+        df = monthly_summary(result, calc)
+        # FTE rows (even indices) carry the p_direct strings; ensure subtraction worked.
+        for i in range(0, len(df), 2):
+            p = df.iloc[i]["p_direct"]
+            if p:  # non-empty string
+                assert int(p) < 50, f"Expected p_direct < 50 after -60 offset, got {p}"
+
+
 # =============================================================================
 # DEMAND STREAMS
 # =============================================================================

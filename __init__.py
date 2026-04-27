@@ -38,6 +38,7 @@ from Calendar import (
 )
 from diagnostics import (
     weekly_summary,
+    monthly_summary,
     monthly_candlestick_chart,
     daily_inventory_with_p_chart,
     monthly_waterfall_chart,
@@ -86,6 +87,7 @@ __all__ = [
     "print_calendar_summary",
     # Diagnostics
     "weekly_summary",
+    "monthly_summary",
     "monthly_candlestick_chart",
     "daily_inventory_with_p_chart",
     "monthly_waterfall_chart",
