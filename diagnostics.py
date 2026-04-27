@@ -20,42 +20,113 @@ from Cycle_time_calculator import (
 # =============================================================================
 # WEEKLY AGGREGATION
 # =============================================================================
-# Week = ISO week (Monday start). Each week summarizes arrivals, closures,
-# capacity, inventory level, avg age. Finer grain than monthly — useful for
-# spotting mid-month anomalies.
+# Week = ISO week (Monday start). Each row summarizes one week:
+#   week                  → first day of the week (Monday)
+#   demand                → total arrivals across all streams that week
+#   avg_fte               → avg daily total FTE (sum across worker groups, then avg)
+#   avg_inv_age           → avg of daily open-inventory average age
+#   p_direct              → P_n of closed-item ages this week
+#   p_from_open_ratio     → max-daily-avg-open-age × open_inventory_ratio
+#   p_from_closed_ratio   → max-daily-avg-closed-age × closed_inventory_ratio
+#
+# All three P_n values respect the scenario's `workable_age_min` offset
+# (subtract `workable_age_min - 1`) — same convention as monthly metrics.
 # =============================================================================
 
-def weekly_summary(result: DeterministicResult) -> pd.DataFrame:
-    """Return per-ISO-week rollup across all daily results."""
-    rows = []
+def weekly_summary(
+    result: DeterministicResult,
+    calc: DeterministicCycleTimeCalculator,
+) -> pd.DataFrame:
+    """Return per-ISO-week rollup with FTE, demand, inventory age, and P_n."""
+    scenario = calc.scenario
+    p = scenario.reporting_percentile
+    offset = (scenario.workable_age_min - 1) if scenario.workable_age_min is not None else 0
+
+    # Build per-day rows including everything we need to aggregate later.
+    daily_rows = []
     for dr in result.daily_results:
         iso_year, iso_week, _ = dr.date.isocalendar()
-        total_arrivals = float(sum(a["volume"] for a in dr.arrivals))
-        rows.append({
-            "iso_year":        iso_year,
-            "iso_week":        iso_week,
-            "date":            dr.date,
-            "capacity":        dr.total_capacity,
-            "burned":          dr.total_burned,
-            "arrivals":        total_arrivals,
-            "inv_end_of_day":  dr.open_inventory_after.get_total_items(),
-            "avg_inv_age":     dr.open_inventory_after.calculate_average_age(),
+        total_demand_today = float(sum(a["volume"] for a in dr.arrivals))
+        total_fte_today = float(sum(g["fte_for_month"] for g in dr.group_stats))
+        closed_ages_today = dr.get_closed_items_ages()
+        avg_closed_age_today = float(np.mean(closed_ages_today)) if closed_ages_today else None
+        daily_rows.append({
+            "iso_year":             iso_year,
+            "iso_week":             iso_week,
+            "date":                 dr.date,
+            "demand":               total_demand_today,
+            "total_fte":            total_fte_today,
+            "avg_inv_age":          dr.open_inventory_after.calculate_average_age(),
+            "closed_ages":          closed_ages_today,
+            "avg_closed_age_today": avg_closed_age_today,
         })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
 
-    grouped = df.groupby(["iso_year", "iso_week"]).agg(
-        week_start=("date", "min"),
-        week_end=("date", "max"),
-        total_capacity=("capacity", "sum"),
-        total_burned=("burned", "sum"),
-        total_arrivals=("arrivals", "sum"),
-        avg_daily_capacity=("capacity", "mean"),
-        end_inv=("inv_end_of_day", "last"),
-        avg_inv_age=("avg_inv_age", "mean"),
-    ).reset_index()
-    return grouped
+    if not daily_rows:
+        return pd.DataFrame()
+
+    # Group rows by (iso_year, iso_week)
+    weeks: Dict[Tuple[int, int], List[Dict]] = {}
+    for r in daily_rows:
+        weeks.setdefault((r["iso_year"], r["iso_week"]), []).append(r)
+
+    def _ceil_int(x):
+        return int(np.ceil(x)) if x is not None else None
+
+    out_rows = []
+    for (_iy, _iw), week_rows in sorted(weeks.items()):
+        week_start = min(r["date"] for r in week_rows)
+
+        total_demand = sum(r["demand"] for r in week_rows)
+        avg_fte = float(np.mean([r["total_fte"] for r in week_rows]))
+        avg_inv_age = float(np.mean([r["avg_inv_age"] for r in week_rows]))
+
+        # P_direct: percentile of all closed-item ages in the week
+        all_closed: List[int] = []
+        for r in week_rows:
+            all_closed.extend(r["closed_ages"])
+        p_direct_raw = float(np.percentile(all_closed, p)) if all_closed else None
+
+        # P_from_open_ratio: max daily avg-open-age × open_inventory_ratio
+        max_open = max((r["avg_inv_age"] for r in week_rows), default=None)
+        p_from_open_raw = (
+            max_open * scenario.open_inventory_ratio if max_open is not None else None
+        )
+
+        # P_from_closed_ratio: max daily avg-closed-age × closed_inventory_ratio
+        max_closed_vals = [
+            r["avg_closed_age_today"] for r in week_rows
+            if r["avg_closed_age_today"] is not None
+        ]
+        max_closed = max(max_closed_vals) if max_closed_vals else None
+        p_from_closed_raw = (
+            max_closed * scenario.closed_inventory_ratio if max_closed is not None else None
+        )
+
+        p_direct = _ceil_int(p_direct_raw)
+        p_from_open = _ceil_int(p_from_open_raw)
+        p_from_closed = _ceil_int(p_from_closed_raw)
+
+        # Subtract pre-workable offset (e.g. EDD: 60) so reported cycle time
+        # reflects operational period only.
+        if offset:
+            if p_direct is not None:
+                p_direct = p_direct - offset
+            if p_from_open is not None:
+                p_from_open = p_from_open - offset
+            if p_from_closed is not None:
+                p_from_closed = p_from_closed - offset
+
+        out_rows.append({
+            "week":                 week_start,
+            "demand":               total_demand,
+            "avg_fte":              round(avg_fte, 2),
+            "avg_inv_age":          round(avg_inv_age, 2),
+            "p_direct":             p_direct,
+            "p_from_open_ratio":    p_from_open,
+            "p_from_closed_ratio":  p_from_closed,
+        })
+
+    return pd.DataFrame(out_rows)
 
 
 # =============================================================================

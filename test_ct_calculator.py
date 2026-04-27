@@ -325,6 +325,89 @@ class TestInventoryFromInputOrPaste:
             )
 
 
+class TestWeeklySummary:
+    def _build_simple_le(self):
+        from diagnostics import weekly_summary
+        from Calendar import CalendarManager, load_all_calendars
+        mgr = CalendarManager()
+        load_all_calendars(mgr, [2026])
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(
+                calendar_type=CalendarType.INTERNAL, name="Internal",
+                current_headcount=10, tpt_by_month=2.4,
+                fte_conversion_by_month=Months(
+                    jan=0.75, feb=0.75, mar=0.75, apr=0.75, may=0.75, jun=0.75,
+                    jul=0.75, aug=0.75, sep=0.75, oct=0.75, nov=0.75, dec=0.75,
+                ),
+            ),
+        ])
+        s = DeterministicScenario(
+            name="LE",
+            workforce=wf,
+            initial_inventory=DeterministicInventory(items_by_age={5: 100, 10: 50}),
+            demand=DeterministicDemand(streams=[
+                DemandStream(name="x", cadence="daily",
+                             monthly_volume=Months(jan=10), arrival_age=1),
+            ]),
+            calendar_manager=mgr,
+            start_date=date(2026, 1, 5),  # Monday
+            end_date=date(2026, 1, 18),   # 2 weeks
+            open_inventory_ratio=2.0,
+            closed_inventory_ratio=1.0,
+            reporting_percentile=90,
+        )
+        calc = DeterministicCycleTimeCalculator(s)
+        return calc, calc.calculate(), weekly_summary
+
+    def test_columns_match_spec(self):
+        calc, result, weekly_summary = self._build_simple_le()
+        df = weekly_summary(result, calc)
+        # Exact column order matters — these are the user-facing fields
+        expected_cols = [
+            "week", "demand", "avg_fte", "avg_inv_age",
+            "p_direct", "p_from_open_ratio", "p_from_closed_ratio",
+        ]
+        assert list(df.columns) == expected_cols
+        # No iso_year, iso_week, total_capacity, total_burned, end_inv, week_end columns anywhere
+        for forbidden in ["iso_year", "iso_week", "total_capacity", "total_burned",
+                          "end_inv", "week_end", "week_start", "avg_daily_capacity"]:
+            assert forbidden not in df.columns
+
+    def test_workable_age_offset_applied_to_p_values(self):
+        # Build an EDD-style scenario with workable_age_min=61. Reported P_n should
+        # be shifted down by 60 vs. raw ages.
+        from diagnostics import weekly_summary
+        from Calendar import CalendarManager, load_all_calendars
+        mgr = CalendarManager()
+        load_all_calendars(mgr, [2026])
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(calendar_type=CalendarType.INTERNAL,
+                        current_headcount=10, tpt_by_month=2.4,
+                        fte_conversion_by_month=Months(
+                            jan=0.75, feb=0.75, mar=0.75, apr=0.75, may=0.75, jun=0.75,
+                            jul=0.75, aug=0.75, sep=0.75, oct=0.75, nov=0.75, dec=0.75,
+                        )),
+        ])
+        s = DeterministicScenario(
+            name="EDD",
+            workforce=wf,
+            initial_inventory=DeterministicInventory(items_by_age={70: 50, 80: 30}),
+            demand=DeterministicDemand(),
+            calendar_manager=mgr,
+            start_date=date(2026, 1, 5), end_date=date(2026, 1, 11),
+            open_inventory_ratio=2.0, closed_inventory_ratio=1.0,
+            reporting_percentile=90,
+            workable_age_min=61,
+        )
+        calc = DeterministicCycleTimeCalculator(s)
+        df = weekly_summary(calc.calculate(), calc)
+        # Closed-item ages would be in the 70–80 range; subtracting 60 gives 10–20.
+        # Just assert that p_direct (if present) is sensibly small (<50).
+        if df["p_direct"].notna().any():
+            assert df["p_direct"].max() < 50, \
+                f"Expected workable-age offset to shrink p_direct, got {df['p_direct'].tolist()}"
+
+
 # =============================================================================
 # DEMAND STREAMS
 # =============================================================================
