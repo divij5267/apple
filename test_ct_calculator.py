@@ -704,3 +704,158 @@ class TestScenarioValidate:
     def test_workable_window_inverted(self):
         s = DeterministicScenario(workable_age_min=200, workable_age_max=50)
         assert any("workable_age_min" in msg for msg in s.validate())
+
+
+# =============================================================================
+# FTE OVERRIDE — direct FTE input bypasses headcount math
+# =============================================================================
+
+class TestFteOverride:
+    """fte_override_by_month bypasses current_headcount + ramp + attrition +
+    hires + removals + fte_conversion entirely. TPT and day_factor still
+    apply: capacity = fte_override × day_factor × tpt.
+    """
+
+    def _wf(self, **kwargs):
+        return DeterministicWorkforce(worker_groups=[
+            WorkerGroup(calendar_type=CalendarType.USA, name="rs", **kwargs),
+        ])
+
+    def test_scalar_override_returns_same_fte_every_month(self):
+        wf = self._wf(tpt_by_month=2.4, fte_override_by_month=30.0)
+        sim_start = date(2026, 1, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 15)) == 30.0
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 7, 1)) == 30.0
+        assert wf.group_uses_fte_override(0)
+
+    def test_months_override_resolves_per_month(self):
+        wf = self._wf(
+            tpt_by_month=2.4,
+            fte_override_by_month=Months(jan=30, feb=35, mar=40),
+        )
+        sim_start = date(2026, 1, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 1, 31)) == 30
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 2, 14)) == 35
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 5)) == 40
+
+    def test_12_list_override_cycles_sim_relative(self):
+        # sim_start = March 2026 → list[0] = March
+        wf = self._wf(
+            tpt_by_month=2.4,
+            fte_override_by_month=[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        )
+        sim_start = date(2026, 3, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 1)) == 10
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 4, 1)) == 11
+        # Wraps after 12 months
+        assert wf.group_fte_for_date(0, sim_start, date(2027, 3, 1)) == 10
+
+    def test_year_dict_and_tuple_override(self):
+        wf = self._wf(
+            tpt_by_month=2.4,
+            fte_override_by_month={
+                2026: Months(jan=30),
+                2027: 40.0,
+                (2026, 6): 99.0,  # spot beats year-dict
+            },
+        )
+        sim_start = date(2026, 1, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 1, 15)) == 30
+        assert wf.group_fte_for_date(0, sim_start, date(2027, 8, 1)) == 40
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 6, 10)) == 99
+
+    def test_override_wins_over_headcount_fields(self):
+        # Both override and headcount-based fields set; override wins.
+        wf = self._wf(
+            current_headcount=999,            # would normally drive FTE
+            fte_conversion_by_month=0.5,
+            tpt_by_month=2.4,
+            fte_override_by_month=20.0,
+        )
+        sim_start = date(2026, 1, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 1)) == 20.0
+        # And override_notes flags the conflict
+        notes = wf.override_notes()
+        assert any("IGNORED" in n for n in notes)
+
+    def test_internal_with_override_skips_fte_conversion_requirement(self):
+        # INTERNAL group normally REQUIRES fte_conversion_by_month — override
+        # mode waives that.
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(
+                calendar_type=CalendarType.INTERNAL,
+                name="internal-override",
+                tpt_by_month=2.4,
+                fte_override_by_month=Months(jan=30, feb=32),
+                # NB: no fte_conversion_by_month, no current_headcount
+            ),
+        ])
+        issues = wf.validate()
+        assert not any("fte_conversion_by_month" in i for i in issues)
+        assert not any("0 headcount" in i.lower() or "no recent_hires" in i.lower()
+                       for i in issues)
+
+    def test_capacity_uses_override_with_day_factor_and_tpt(self):
+        # Full integration: capacity in simulate_day == override × day_factor × tpt.
+        mgr = CalendarManager()
+        load_all_calendars(mgr, [2026])
+        scenario = DeterministicScenario(
+            name="override-cap-test",
+            workforce=DeterministicWorkforce(worker_groups=[
+                WorkerGroup(
+                    calendar_type=CalendarType.USA, name="rs",
+                    tpt_by_month=2.0,
+                    fte_override_by_month=10.0,
+                ),
+            ]),
+            initial_inventory=DeterministicInventory(items_by_age={1: 1000}),
+            demand=DeterministicDemand(streams=[]),
+            calendar_manager=mgr,
+            start_date=date(2026, 1, 5),   # Monday
+            end_date=date(2026, 1, 10),    # Saturday
+        )
+        calc = DeterministicCycleTimeCalculator(scenario)
+        result = calc.calculate()
+        # Mon-Fri: full day → capacity 10 × 1.0 × 2.0 = 20
+        # Sat: weekend → 0
+        days_by_date = {dr.date: dr for dr in result.daily_results}
+        assert days_by_date[date(2026, 1, 5)].total_capacity == 20.0
+        assert days_by_date[date(2026, 1, 9)].total_capacity == 20.0
+        assert days_by_date[date(2026, 1, 10)].total_capacity == 0.0
+        # group_stats carries the source tag
+        assert days_by_date[date(2026, 1, 5)].group_stats[0]["fte_source"] == "override"
+
+    def test_internal_and_rs_separately_with_override(self):
+        # The whole point — Internal and RS each get their own override.
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(
+                calendar_type=CalendarType.INTERNAL, name="internal",
+                tpt_by_month=2.4,
+                fte_override_by_month=Months(jan=25, feb=27),
+            ),
+            WorkerGroup(
+                calendar_type=CalendarType.USA, name="rs",
+                tpt_by_month=2.4,
+                fte_override_by_month=10.0,
+            ),
+        ])
+        sim_start = date(2026, 1, 1)
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 1, 15)) == 25
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 2, 15)) == 27
+        assert wf.group_fte_for_date(1, sim_start, date(2026, 1, 15)) == 10
+        assert wf.group_fte_for_date(1, sim_start, date(2026, 2, 15)) == 10
+
+    def test_override_unset_uses_headcount_math(self):
+        # Regression: when override is None, behavior is unchanged.
+        wf = DeterministicWorkforce(worker_groups=[
+            WorkerGroup(
+                calendar_type=CalendarType.USA, name="rs",
+                current_headcount=10,
+                tpt_by_month=2.4,
+                # fte_override_by_month omitted
+            ),
+        ])
+        sim_start = date(2026, 1, 1)
+        assert not wf.group_uses_fte_override(0)
+        # 10 HC × default 1.0 RS conversion = 10
+        assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 1)) == 10.0

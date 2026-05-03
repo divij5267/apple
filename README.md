@@ -90,6 +90,44 @@ To activate a queue:
 
 ---
 
+## Direct FTE input (skip the headcount math)
+
+Every `WorkerGroup` accepts an optional `fte_override_by_month` field. When
+set, it BYPASSES `current_headcount`, `recent_hires`, ramp, attrition,
+`monthly_hires`, `rightsource_removals_per_month`, and
+`fte_conversion_by_month` for that group — the FTE comes straight from
+the override. `tpt_by_month` is still required, and the calendar
+(weekends/holidays/half-days) still applies via `day_factor`. Capacity
+becomes:
+
+```
+capacity = fte_override × day_factor × tpt
+```
+
+Same `MonthlyInput` grammar as everywhere else (scalar, 12-list,
+`Months(jan=…)`, year-dict, `(year, month)` tuple). Internal and RS each
+have their own field, so you can mix modes (e.g. Internal computed from
+headcount, RS as a direct FTE), or run both groups in override mode.
+
+```python
+WorkerGroup(
+    calendar_type=CalendarType.INTERNAL, name="Internal US",
+    tpt_by_month=2.4,
+    fte_override_by_month=Months(jan=33, feb=34, mar=35),  # one number per month
+)
+
+WorkerGroup(
+    calendar_type=CalendarType.USA, name="RightSource US",
+    tpt_by_month=2.4,
+    fte_override_by_month=6.0,                              # scalar — same all months
+)
+```
+
+If both an override AND headcount-based fields are set, the override wins
+and a non-blocking note prints at sim time naming the ignored fields.
+
+---
+
 ## Key design decisions (see TODO.md for full catalog)
 
 - **Float burn-down.** Counts are fractional — capacity 95.5 closes 95 + 0.5

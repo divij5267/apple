@@ -189,6 +189,12 @@ class DeterministicScenario:
 class DeterministicCycleTimeCalculator:
     def __init__(self, scenario: DeterministicScenario):
         self.scenario = scenario
+        # One-time, non-blocking notes for any worker group that bypasses the
+        # headcount math via fte_override_by_month. Printed at construction so
+        # the user is reminded which groups are "override mode" before sim
+        # output streams in. Does NOT cause scenario.validate() to flag.
+        for note in self.scenario.workforce.override_notes():
+            print(f"i  [{self.scenario.name or 'scenario'}] {note}")
 
     # -------------------------------------------------------------------------
     # Burn-down — FIFO within the workable-age window
@@ -272,8 +278,15 @@ class DeterministicCycleTimeCalculator:
             cal = self.scenario.calendar_manager.get_calendar(group.calendar_type)
             day_type, day_factor = cal.get_day_type(current_date)
 
-            raw_headcount = workforce.raw_headcount(i, sim_start, current_date)
             fte_for_month = workforce.group_fte_for_date(i, sim_start, current_date)
+            override_mode = workforce.group_uses_fte_override(i)
+            # In override mode the headcount pool is conceptually undefined;
+            # mirror the FTE value so diagnostics stay consistent. Otherwise
+            # compute the real headcount math.
+            if override_mode:
+                raw_headcount = fte_for_month
+            else:
+                raw_headcount = workforce.raw_headcount(i, sim_start, current_date)
             effective_fte = fte_for_month * day_factor
             tpt = workforce.group_tpt_for_date(i, sim_start, current_date)
             capacity = effective_fte * tpt
@@ -289,6 +302,7 @@ class DeterministicCycleTimeCalculator:
                 "effective_fte": effective_fte,
                 "tpt": tpt,
                 "capacity": capacity,
+                "fte_source": "override" if override_mode else "computed",
             })
 
         # 3) FIFO burn-down (workable-window filtered) then age +1

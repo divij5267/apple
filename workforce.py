@@ -170,6 +170,20 @@ class WorkerGroup:
     #   other RS  : leave None -> defaults to 1.0
     fte_conversion_by_month: Optional[MonthlyInput] = None
 
+    # ---- DIRECT FTE OVERRIDE -------------------------------------------------
+    # When set, the group's monthly FTE is taken DIRECTLY from this field and
+    # the entire headcount-based math (current_headcount + ramp + hires -
+    # attrition - removals) × fte_conversion_by_month is BYPASSED. TPT is
+    # still required; day_factor (weekends/holidays) is still applied.
+    # Same MonthlyInput grammar as everywhere else (scalar / 12-list /
+    # Months() / year-dict / (year, month) tuple). Unset (None) keeps the
+    # default headcount-derived behavior.
+    #   e.g. fte_override_by_month=30.0
+    #        fte_override_by_month=Months(jan=30, feb=32, mar=34)
+    #        fte_override_by_month={2026: Months(jan=30), 2027: 35}
+    # ------------------------------------------------------------------------
+    fte_override_by_month: Optional[MonthlyInput] = None
+
     def ramp_factor(self, tenure_months: int) -> float:
         """Linear ramp: tenure/ramp_period, capped at 1.0. Tenure 0 -> 0."""
         if tenure_months <= 0:
@@ -241,11 +255,29 @@ class DeterministicWorkforce:
         sim_start: date,
         current_date: date,
     ) -> float:
-        """raw_headcount x fte_conversion_by_month for the (year, month) of current_date."""
+        """FTE for (year, month) of current_date.
+
+        If `fte_override_by_month` is set on the group, that value wins
+        outright — raw_headcount, ramp, attrition, hires, removals, and
+        fte_conversion are ALL bypassed. Otherwise:
+        raw_headcount x fte_conversion_by_month.
+        """
         group = self.worker_groups[group_idx]
+        if group.fte_override_by_month is not None:
+            return resolve_monthly(
+                group.fte_override_by_month,
+                current_date.year,
+                current_date.month,
+                sim_start,
+                default=None,
+            )
         fte_conv = self._get_fte_conversion(group, sim_start, current_date)
         raw = self.raw_headcount(group_idx, sim_start, current_date)
         return raw * fte_conv
+
+    def group_uses_fte_override(self, group_idx: int) -> bool:
+        """True if this group bypasses headcount math via fte_override_by_month."""
+        return self.worker_groups[group_idx].fte_override_by_month is not None
 
     def group_tpt_for_date(
         self,
@@ -367,18 +399,27 @@ class DeterministicWorkforce:
         issues: List[str] = []
         for i, g in enumerate(self.worker_groups):
             label = g.name or f"WorkerGroup[{i}] ({g.calendar_type.value})"
+            override_set = g.fte_override_by_month is not None
 
             if g.tpt_by_month is None:
                 issues.append(f"{label}: tpt_by_month is NOT SET (required for every group).")
 
-            if g.fte_conversion_by_month is None and g.calendar_type == CalendarType.INTERNAL:
+            # INTERNAL fte_conversion is required ONLY when override is not used.
+            if (
+                not override_set
+                and g.fte_conversion_by_month is None
+                and g.calendar_type == CalendarType.INTERNAL
+            ):
                 issues.append(
                     f"{label}: INTERNAL group must set fte_conversion_by_month "
                     "(per-month non-prod factor)."
                 )
 
+            # The "0 headcount + no hires" warning only applies in the
+            # headcount-based mode. Override mode supplies FTE directly.
             if (
-                g.current_headcount == 0
+                not override_set
+                and g.current_headcount == 0
                 and not g.recent_hires
                 and not g.monthly_hires
             ):
@@ -395,6 +436,44 @@ class DeterministicWorkforce:
                 )
 
         return issues
+
+    def override_notes(self) -> List[str]:
+        """Non-blocking informational notes about FTE-override usage.
+
+        Distinct from `validate()` — these never cause a scenario to be
+        skipped. Returned as a list of human-readable strings; printed by
+        `print_summary()` and by the calculator at construction time so the
+        user is reminded which groups bypass the headcount math.
+        """
+        notes: List[str] = []
+        for i, g in enumerate(self.worker_groups):
+            if g.fte_override_by_month is None:
+                continue
+            label = g.name or f"WorkerGroup[{i}] ({g.calendar_type.value})"
+            notes.append(
+                f"{label}: using fte_override_by_month — headcount/ramp/"
+                "attrition/hires/conversion math is BYPASSED. Capacity = "
+                "fte_override x day_factor x tpt."
+            )
+            conflicts: List[str] = []
+            if g.current_headcount:
+                conflicts.append("current_headcount")
+            if g.recent_hires:
+                conflicts.append("recent_hires")
+            if g.monthly_hires:
+                conflicts.append("monthly_hires")
+            if g.attrition_per_month:
+                conflicts.append("attrition_per_month")
+            if g.rightsource_removals_per_month:
+                conflicts.append("rightsource_removals_per_month")
+            if g.fte_conversion_by_month is not None:
+                conflicts.append("fte_conversion_by_month")
+            if conflicts:
+                notes.append(
+                    f"{label}: also set (and IGNORED, override wins): "
+                    + ", ".join(conflicts)
+                )
+        return notes
 
     def print_summary(self, sim_start: date, end_date: date) -> None:
         """Print a monthly per-group breakdown of raw_headcount / FTE / capacity.
@@ -415,17 +494,47 @@ class DeterministicWorkforce:
                 print(f"   - {msg}")
             print()
 
+        notes = self.override_notes()
+        if notes:
+            print("\n** FTE OVERRIDE NOTES (non-blocking):")
+            for msg in notes:
+                print(f"   - {msg}")
+            print()
+
         months_in_sim = _iter_sim_months(sim_start, end_date)
 
         for i, g in enumerate(self.worker_groups):
             label = g.name or g.calendar_type.value
-            print(f"\n--- {label}  [{g.calendar_type.value}] ---")
+            override_set = g.fte_override_by_month is not None
+            tag = "  (FTE OVERRIDE)" if override_set else ""
+            print(f"\n--- {label}  [{g.calendar_type.value}]{tag} ---")
 
             if g.tpt_by_month is None or (
-                g.fte_conversion_by_month is None
+                not override_set
+                and g.fte_conversion_by_month is None
                 and g.calendar_type == CalendarType.INTERNAL
             ):
                 print("  (skipped — required fields missing; see issues above)")
+                continue
+
+            if override_set:
+                # Compact 3-column layout: FTE comes from override, no
+                # headcount / FTE-conversion to display.
+                print(f"  {'Y-M':<8} {'FTE':>9} {'TPT':>7} {'Day cap':>9}")
+                for year, month in months_in_sim:
+                    ref_day = _calendar.monthrange(year, month)[1]
+                    if (year, month) == (end_date.year, end_date.month):
+                        ref_day = end_date.day
+                    ref_date = date(year, month, ref_day)
+                    fte = self.group_fte_for_date(i, sim_start, ref_date)
+                    tpt = resolve_monthly(
+                        g.tpt_by_month, year, month, sim_start, default=None,
+                    )
+                    day_cap = fte * tpt
+                    print(
+                        f"  {year}-{month:02d}  {fte:>9.2f} "
+                        f"{tpt:>7.2f} {day_cap:>9.2f}"
+                    )
                 continue
 
             print(
