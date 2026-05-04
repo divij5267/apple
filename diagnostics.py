@@ -479,15 +479,21 @@ def daily_inventory_with_p_chart(
 # month's ending inventory across to the next month's starting position.
 # Only the first month shows a "start:" badge (subsequent months start where
 # the previous ended — shown by "end: XXXX" badge + dotted line).
+# Pn (reporting percentile) badge sits above each month's peak, same source-
+# method default as the candlestick (`p_from_open_ratio`).
 # =============================================================================
 
 def monthly_waterfall_chart(
     result: DeterministicResult,
     calc: DeterministicCycleTimeCalculator,
+    method: str = "p_from_open_ratio",
     ax=None,
 ):
-    """Plot monthly waterfall: Start + Demand (stacked by stream) − Burned = End."""
+    """Plot monthly waterfall: Start + Demand (stacked by stream) − Burned = End,
+    with monthly Pn cycle-time badge above each month's peak.
+    """
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
     scenario = calc.scenario
 
@@ -536,6 +542,11 @@ def monthly_waterfall_chart(
     peaks = starts + demand_totals
 
     labels = [f"{m:02d}" for _, m in sorted_keys]
+
+    # Monthly Pn values + label position above the highest month-peak
+    p_vals = _monthly_p_values(result, calc, method)
+    pn_label = _pn_label(scenario)
+    p_label_y = peaks.max() * 1.14
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(max(16, 1.3 * len(labels)), 8))
@@ -601,15 +612,27 @@ def monthly_waterfall_chart(
                 bbox=dict(boxstyle="round,pad=0.15", fc="#E8F5E9",
                           ec="#2E7D32", lw=0.6))
 
+        # Pn badge — same lemonchiffon style as the other two charts.
+        p_val = p_vals.get(k)
+        p_text = f"{pn_label}\n{p_val}d" if p_val is not None else f"{pn_label}\n—"
+        ax.text(x_center, p_label_y, p_text, ha="center", va="center",
+                fontsize=9, fontweight="bold", color="#37474F",
+                bbox=dict(boxstyle="round,pad=0.25", fc="lemonchiffon",
+                          ec="#37474F", lw=0.8))
+
     ax.set_xticks(x_positions)
     ax.set_xticklabels(labels)
     ax.set_xlabel("Month")
     ax.set_ylabel("Items (waterfall — each bar starts where previous ended)")
-    ax.set_ylim(0, peaks.max() * 1.10)
+    ax.set_ylim(0, p_label_y * 1.08)
     ax.set_title(f"{scenario.name} — Monthly waterfall: "
                  "Start + Demand (stacked) − Burned = End", fontsize=12)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.17), ncol=5,
-              fontsize=9, frameon=False)
+    # Legend: implicit handles from bar labels + manual Pn patch.
+    handles, _ = ax.get_legend_handles_labels()
+    handles.append(Patch(facecolor="lemonchiffon", edgecolor="#37474F",
+                         label=f"Monthly {pn_label} (days)"))
+    ax.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.17),
+              ncol=6, fontsize=9, frameon=False)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     return fig
@@ -637,7 +660,7 @@ def render_scenario_charts(
     fig2 = daily_inventory_with_p_chart(result, calc, method=method)
     if show:
         plt.show()
-    fig3 = monthly_waterfall_chart(result, calc)
+    fig3 = monthly_waterfall_chart(result, calc, method=method)
     if show:
         plt.show()
     return fig1, fig2, fig3
