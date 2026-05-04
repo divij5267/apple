@@ -859,3 +859,107 @@ class TestFteOverride:
         assert not wf.group_uses_fte_override(0)
         # 10 HC × default 1.0 RS conversion = 10
         assert wf.group_fte_for_date(0, sim_start, date(2026, 3, 1)) == 10.0
+
+
+# =============================================================================
+# DIAGNOSTIC AGGREGATIONS — avg_inv_age is volume-weighted, not avg-of-avgs
+# =============================================================================
+
+class TestAvgInvAgeWeighting:
+    """avg_inv_age in weekly_summary and monthly_summary must be volume-
+    weighted across the period (sum(age × count) / sum(count)), NOT a
+    simple mean of daily averages. With unequal daily inventory volumes
+    these two numbers diverge significantly.
+    """
+
+    def _build_handcrafted_result(self):
+        """Build a DeterministicResult with hand-crafted daily inventories.
+
+        3 sim days. Each day's open_inventory_after is set explicitly so we
+        know exactly what the volume-weighted average should be:
+            Day 1: 1000 items at age 10  → daily avg 10
+            Day 2:  100 items at age 80  → daily avg 80
+            Day 3:   10 items at age 100 → daily avg 100
+
+        avg-of-avgs would be (10 + 80 + 100) / 3 = 63.33
+        volume-weighted would be (1000*10 + 100*80 + 10*100) / 1110 ≈ 17.21
+        """
+        from Cycle_time_calculator import DailyBurnDown, DeterministicResult
+
+        def _inv(items):
+            inv = DeterministicInventory()
+            inv.items_by_age = items
+            return inv
+
+        days = [
+            (date(2026, 1, 5), {10: 1000.0}),
+            (date(2026, 1, 6), {80:  100.0}),
+            (date(2026, 1, 7), {100:  10.0}),
+        ]
+        daily_results = []
+        for d, items in days:
+            daily_results.append(DailyBurnDown(
+                date=d,
+                group_stats=[{"name": "rs", "fte_for_month": 5.0, "tpt": 2.4,
+                              "calendar_type": "usa", "day_type": "full_day",
+                              "day_factor": 1.0, "raw_headcount": 5.0,
+                              "effective_fte": 5.0, "capacity": 12.0,
+                              "fte_source": "computed"}],
+                arrivals=[],
+                total_capacity=12.0,
+                total_burned=0.0,
+                closed_items=[],
+                open_inventory_after=_inv(items),
+            ))
+        return DeterministicResult(
+            scenario_name="weighting-test",
+            start_date=days[0][0],
+            end_date=days[-1][0],
+            initial_inventory=_inv({10: 1000.0}),
+            daily_results=daily_results,
+        )
+
+    def _calc(self, result):
+        # Minimal scenario just to satisfy the calculator-needs-a-scenario
+        # contract used by weekly_summary / monthly_summary.
+        mgr = CalendarManager()
+        load_all_calendars(mgr, [2026])
+        scen = DeterministicScenario(
+            name="weighting-test",
+            workforce=DeterministicWorkforce(worker_groups=[
+                WorkerGroup(calendar_type=CalendarType.USA, name="rs",
+                            current_headcount=5, tpt_by_month=2.4),
+            ]),
+            initial_inventory=result.initial_inventory,
+            calendar_manager=mgr,
+            start_date=result.start_date,
+            end_date=result.end_date,
+            reporting_percentile=90,
+        )
+        return DeterministicCycleTimeCalculator(scen)
+
+    def test_weekly_avg_inv_age_is_volume_weighted(self):
+        from diagnostics import weekly_summary
+        result = self._build_handcrafted_result()
+        calc = self._calc(result)
+        df = weekly_summary(result, calc)
+        # All 3 days fall in the same ISO week → one row.
+        assert len(df) == 1
+        avg = df["avg_inv_age"].iloc[0]
+        # Volume-weighted: (1000*10 + 100*80 + 10*100) / (1000 + 100 + 10)
+        expected = (1000 * 10 + 100 * 80 + 10 * 100) / 1110
+        assert abs(avg - expected) < 0.01, f"got {avg}, expected {expected:.2f}"
+        # Avg-of-avgs would have given 63.33 — verify we are NOT that.
+        assert abs(avg - 63.33) > 1.0
+
+    def test_monthly_avg_inv_age_is_volume_weighted(self):
+        from diagnostics import monthly_summary
+        result = self._build_handcrafted_result()
+        calc = self._calc(result)
+        df = monthly_summary(result, calc)
+        # Two-line-per-row layout — first row holds the scalar metric.
+        avg_str = df["avg_inv_age"].iloc[0]  # formatted as "%.2f"
+        avg = float(avg_str)
+        expected = (1000 * 10 + 100 * 80 + 10 * 100) / 1110
+        assert abs(avg - expected) < 0.01, f"got {avg}, expected {expected:.2f}"
+        assert abs(avg - 63.33) > 1.0

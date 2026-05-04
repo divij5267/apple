@@ -24,7 +24,12 @@ from Cycle_time_calculator import (
 #   week                  → first day of the week (Monday)
 #   demand                → total arrivals across all streams that week
 #   avg_fte               → avg daily total FTE (sum across worker groups, then avg)
-#   avg_inv_age           → avg of daily open-inventory average age
+#   avg_inv_age           → INVENTORY-VOLUME-WEIGHTED average open-inventory age
+#                            across the week — sum(age × count) over all (day,
+#                            age-bucket) pairs, divided by sum(count). Days with
+#                            more inventory weigh more, so a tiny-inventory day
+#                            with a stale outlier doesn't distort the number.
+#                            (Was: simple mean of daily averages — fixed.)
 #   p_direct              → P_n of closed-item ages this week
 #   p_from_open_ratio     → max-daily-avg-open-age × open_inventory_ratio
 #   p_from_closed_ratio   → max-daily-avg-closed-age × closed_inventory_ratio
@@ -43,6 +48,10 @@ def weekly_summary(
     offset = (scenario.workable_age_min - 1) if scenario.workable_age_min is not None else 0
 
     # Build per-day rows including everything we need to aggregate later.
+    # We carry both the daily avg age (used for the max-based Pn ratios) AND
+    # the raw (sum_age_x_count, total_count) so the weekly avg_inv_age can be
+    # computed volume-weighted across the week, not as a simple mean of daily
+    # averages (which is biased when daily inventory size varies).
     daily_rows = []
     for dr in result.daily_results:
         iso_year, iso_week, _ = dr.date.isocalendar()
@@ -50,6 +59,9 @@ def weekly_summary(
         total_fte_today = float(sum(g["fte_for_month"] for g in dr.group_stats))
         closed_ages_today = dr.get_closed_items_ages()
         avg_closed_age_today = float(np.mean(closed_ages_today)) if closed_ages_today else None
+        items_by_age = dr.open_inventory_after.items_by_age
+        age_weighted_sum_today = float(sum(a * c for a, c in items_by_age.items()))
+        total_count_today = float(sum(items_by_age.values()))
         daily_rows.append({
             "iso_year":             iso_year,
             "iso_week":             iso_week,
@@ -57,6 +69,8 @@ def weekly_summary(
             "demand":               total_demand_today,
             "total_fte":            total_fte_today,
             "avg_inv_age":          dr.open_inventory_after.calculate_average_age(),
+            "age_weighted_sum":     age_weighted_sum_today,
+            "total_inv_count":      total_count_today,
             "closed_ages":          closed_ages_today,
             "avg_closed_age_today": avg_closed_age_today,
         })
@@ -78,7 +92,13 @@ def weekly_summary(
 
         total_demand = sum(r["demand"] for r in week_rows)
         avg_fte = float(np.mean([r["total_fte"] for r in week_rows]))
-        avg_inv_age = float(np.mean([r["avg_inv_age"] for r in week_rows]))
+        # Volume-weighted average inventory age across the week:
+        # sum(age × count) / sum(count) over all daily snapshots.
+        # NOT a simple mean of daily averages — that would weight a 10-item
+        # day the same as a 10,000-item day, which distorts the picture.
+        weighted_sum = sum(r["age_weighted_sum"] for r in week_rows)
+        total_count = sum(r["total_inv_count"] for r in week_rows)
+        avg_inv_age = (weighted_sum / total_count) if total_count > 0 else 0.0
 
         # P_direct: percentile of all closed-item ages in the week
         all_closed: List[int] = []
@@ -155,7 +175,10 @@ def monthly_summary(
     # Group names (preserve order from the scenario's worker_groups)
     group_names = [gs["name"] for gs in result.daily_results[0].group_stats]
 
-    # Per-day data
+    # Per-day data. Same setup as weekly_summary — we carry the per-day
+    # numerator/denominator so the monthly avg_inv_age can be computed
+    # volume-weighted (sum(age × count) / sum(count)) instead of as a
+    # simple mean of daily averages.
     daily_rows: List[Dict] = []
     for dr in result.daily_results:
         total_demand_today = float(sum(a["volume"] for a in dr.arrivals))
@@ -163,15 +186,20 @@ def monthly_summary(
         tpt_by_group = {gs["name"]: gs["tpt"] for gs in dr.group_stats}
         closed_ages_today = dr.get_closed_items_ages()
         avg_closed = float(np.mean(closed_ages_today)) if closed_ages_today else None
+        items_by_age = dr.open_inventory_after.items_by_age
+        age_weighted_sum_today = float(sum(a * c for a, c in items_by_age.items()))
+        total_count_today = float(sum(items_by_age.values()))
         daily_rows.append({
-            "year":          dr.date.year,
-            "month":         dr.date.month,
-            "demand":        total_demand_today,
-            "fte_by_group":  fte_by_group,
-            "tpt_by_group":  tpt_by_group,
-            "avg_inv_age":   dr.open_inventory_after.calculate_average_age(),
-            "closed_ages":   closed_ages_today,
-            "avg_closed":    avg_closed,
+            "year":              dr.date.year,
+            "month":             dr.date.month,
+            "demand":            total_demand_today,
+            "fte_by_group":      fte_by_group,
+            "tpt_by_group":      tpt_by_group,
+            "avg_inv_age":       dr.open_inventory_after.calculate_average_age(),
+            "age_weighted_sum":  age_weighted_sum_today,
+            "total_inv_count":   total_count_today,
+            "closed_ages":       closed_ages_today,
+            "avg_closed":        avg_closed,
         })
 
     months: Dict[Tuple[int, int], List[Dict]] = {}
@@ -186,7 +214,10 @@ def monthly_summary(
         total_demand = sum(r["demand"] for r in rows)
         ftes = {g: float(np.mean([r["fte_by_group"][g] for r in rows])) for g in group_names}
         tpts = {g: float(np.mean([r["tpt_by_group"][g] for r in rows])) for g in group_names}
-        avg_inv_age = float(np.mean([r["avg_inv_age"] for r in rows]))
+        # Volume-weighted monthly avg_inv_age — see weekly_summary for rationale.
+        weighted_sum = sum(r["age_weighted_sum"] for r in rows)
+        total_count = sum(r["total_inv_count"] for r in rows)
+        avg_inv_age = (weighted_sum / total_count) if total_count > 0 else 0.0
 
         # P_n metrics (same logic as monthly metrics + workable-age offset)
         all_closed: List[int] = []
